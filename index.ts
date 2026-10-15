@@ -3,6 +3,7 @@ import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
 import type { Context } from "telegraf";
 import { Pool } from "pg";
+import { createServer } from "node:http";
 
 const token = process.env.BOT_TOKEN;
 const databaseUrl = process.env.DATABASE_URL;
@@ -1437,6 +1438,15 @@ bot.catch((error) => {
 
 async function main() {
   await pool.query("SELECT 1");
+
+  // Add this inside main(), before bot.launch():
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Padel Tracker is running");
+  });
+
+  server.listen(Number(process.env.PORT) || 3000, "0.0.0.0");
+
   await bot.launch();
   console.log("🎾 Padel Tracker is running");
 }
