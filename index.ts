@@ -4,6 +4,7 @@ import { Telegraf, Markup } from "telegraf";
 import type { Context } from "telegraf";
 import { Pool } from "pg";
 import { createServer } from "node:http";
+import type { PoolClient } from "pg";
 
 const token = process.env.BOT_TOKEN;
 const databaseUrl = process.env.DATABASE_URL;
@@ -240,6 +241,10 @@ type ScoreSet = {
     }
 
     buttons.push([
+      Markup.button.callback("🗑️ Видалити матч", `sd:${matchId}`),
+    ]);
+
+    buttons.push([
       Markup.button.callback("⬅️ Меню", "menu"),
     ]);
 
@@ -340,6 +345,118 @@ type Player = {
   display_name: string;
   username: string | null;
 };
+
+
+type PadelRank = {
+  min: number;
+  name: string;
+  emoji: string;
+};
+
+const PADEL_RANKS: PadelRank[] = [
+  { min: 0, name: "Картопля на корті", emoji: "🥔" },
+  { min: 800, name: "Падел-чікіта", emoji: "🍌" },
+  { min: 900, name: "Файна подача", emoji: "🎾" },
+  { min: 1000, name: "П'яний майстер кунг-фу", emoji: "🥋" },
+  { min: 1100, name: "Баболат-бандит", emoji: "😎" },
+  { min: 1200, name: "Скляний шаман", emoji: "🔮" },
+  { min: 1300, name: "Король чікени", emoji: "👑" },
+  { min: 1400, name: "Падел-магнат", emoji: "💸" },
+  { min: 1550, name: "Машина для апсетів", emoji: "⚡" },
+  { min: 1700, name: "Верховний падел-боженька", emoji: "🏆" },
+];
+
+function getPadelRank(elo: number): PadelRank {
+  const rating = Math.max(0, elo);
+
+  return (
+    [...PADEL_RANKS]
+      .reverse()
+      .find((rank) => rating >= rank.min) ?? PADEL_RANKS[0]
+  );
+}
+
+function formatPadelRank(elo: number): string {
+  const rank = getPadelRank(elo);
+  return `${rank.emoji} ${rank.name}`;
+}
+
+function formatEloChange(change: number): string {
+  if (change > 0) return `+${change}`;
+  return String(change);
+}
+
+
+async function updateMatchElo(
+  client: PoolClient,
+  matchId: string,
+  winner: "A" | "B" | null
+): Promise<void> {
+  const result = await client.query(
+    `SELECT
+       mp.player_id::text AS player_id,
+       mp.team,
+       p.elo_rating
+     FROM match_players mp
+     JOIN players p ON p.telegram_id = mp.player_id
+     WHERE mp.match_id = $1
+     ORDER BY mp.team, mp.player_id
+     FOR UPDATE OF p`,
+    [matchId]
+  );
+
+  const players = result.rows as {
+    player_id: string;
+    team: "A" | "B";
+    elo_rating: number;
+  }[];
+
+  const teamA = players.filter((p) => p.team === "A");
+  const teamB = players.filter((p) => p.team === "B");
+
+  if (teamA.length !== 2 || teamB.length !== 2) {
+    throw new Error(
+      "Для розрахунку ELO потрібні дві команди по двоє гравців."
+    );
+  }
+
+  const avgA =
+    teamA.reduce((sum, p) => sum + Number(p.elo_rating), 0) /
+    teamA.length;
+
+  const avgB =
+    teamB.reduce((sum, p) => sum + Number(p.elo_rating), 0) /
+    teamB.length;
+
+  const expectedA = 1 / (1 + 10 ** ((avgB - avgA) / 400));
+  const actualA = winner === null ? 0.5 : winner === "A" ? 1 : 0;
+
+  const deltaA = Math.round(32 * (actualA - expectedA));
+  const deltaB = Math.round(
+    32 * ((1 - actualA) - (1 - expectedA))
+  );
+
+  for (const player of players) {
+    const delta = player.team === "A" ? deltaA : deltaB;
+
+    await client.query(
+      `UPDATE match_players
+       SET elo_before = $3,
+           elo_change = $4
+       WHERE match_id = $1
+         AND player_id = $2`,
+      [matchId, player.player_id, player.elo_rating, delta]
+    );
+
+    await client.query(
+      `UPDATE players
+       SET elo_rating = elo_rating + $2
+       WHERE telegram_id = $1`,
+      [player.player_id, delta]
+    );
+  }
+}
+
 
 type Draft =
   | { step: "select"; selected: string[] }
@@ -1052,6 +1169,7 @@ bot.action("confirm_teams", async (ctx) => {
         throw new Error("Спочатку збережи або скасуй введення поточного сету.");
       }
 
+
       for (let i = 0; i < state.sets.length; i++) {
         const set = state.sets[i];
 
@@ -1061,6 +1179,18 @@ bot.action("confirm_teams", async (ctx) => {
           [matchId, i + 1, set.a, set.b]
         );
       }
+
+      // Розрахувати ELO в тій самій транзакції.
+      await updateMatchElo(client, matchId, winner);
+
+      await client.query(
+        `UPDATE matches
+         SET status = 'completed',
+             winner_team = $2,
+             played_at = NOW()
+         WHERE id = $1`,
+        [matchId, winner]
+      );
 
       await client.query(
         `UPDATE matches
@@ -1084,6 +1214,120 @@ bot.action("confirm_teams", async (ctx) => {
       await handleScoreError(ctx, error);
     } finally {
       client.release();
+    }
+  });
+
+
+
+  // Запит на видалення незавершеного матчу
+  bot.action(/^sd:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+
+    const matchId = ctx.match[1];
+    const userId = String(ctx.from.id);
+
+    const result = await pool.query(
+      `SELECT id::text, status, created_by::text
+       FROM matches
+       WHERE id = $1`,
+      [matchId]
+    );
+
+    const match = result.rows[0];
+
+    if (!match || match.status !== "in_progress") {
+      await ctx.reply("Матч не знайдено або він уже завершений.");
+      return;
+    }
+
+    if (match.created_by !== userId) {
+      await ctx.reply("❌ Видалити матч може лише його автор.");
+      return;
+    }
+
+    await ctx.reply(
+      `⚠️ Видалити незавершений матч #${matchId}?\n\n` +
+      "Усі дані цього матчу буде видалено. Цю дію не можна скасувати.",
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "🗑️ Так, видалити",
+            `sdconfirm:${matchId}`
+          ),
+          Markup.button.callback("❌ Скасувати", `sdcancel:${matchId}`),
+        ],
+      ])
+    );
+  });
+
+  // Підтвердження видалення
+  bot.action(/^sdconfirm:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+
+    const matchId = ctx.match[1];
+    const userId = String(ctx.from.id);
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const result = await client.query(
+        `SELECT id::text, status, created_by::text
+         FROM matches
+         WHERE id = $1
+         FOR UPDATE`,
+        [matchId]
+      );
+
+      const match = result.rows[0];
+
+      if (!match || match.status !== "in_progress") {
+        throw new Error("Матч не знайдено або він уже завершений.");
+      }
+
+      if (match.created_by !== userId) {
+        throw new Error("Видалити матч може лише його автор.");
+      }
+
+      // Видаляємо залежні записи явно, щоб не залежати від ON DELETE CASCADE.
+      await client.query(
+        `DELETE FROM match_sets WHERE match_id = $1`,
+        [matchId]
+      );
+
+      await client.query(
+        `DELETE FROM match_players WHERE match_id = $1`,
+        [matchId]
+      );
+
+      await client.query(
+        `DELETE FROM matches WHERE id = $1`,
+        [matchId]
+      );
+
+      await client.query("COMMIT");
+
+      await ctx.editMessageText(
+        `🗑️ Матч #${matchId} успішно видалено.`
+      );
+    } catch (error) {
+      await client.query("ROLLBACK");
+      await handleScoreError(ctx, error);
+    } finally {
+      client.release();
+    }
+  });
+
+  // Скасування видалення
+  bot.action(/^sdcancel:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery("Видалення скасовано.");
+
+    try {
+      await ctx.editMessageText(
+        `Матч #${ctx.match[1]} не видалено.`
+      );
+    } catch {
+      await ctx.reply(`Матч #${ctx.match[1]} не видалено.`);
     }
   });
 
@@ -1274,8 +1518,13 @@ async function getAuthorizedAmericanoMatch(
         throw new Error("Ти не є учасником цього матчу.");
       }
 
+
       const { score_a: a, score_b: b } = match;
-      const winner = a > b ? "A" : b > a ? "B" : null;
+      const winner: "A" | "B" | null =
+        a > b ? "A" : b > a ? "B" : null;
+
+      // Нічия також враховується: очікуваний результат дорівнює 0.5.
+      await updateMatchElo(client, matchId, winner);
 
       await client.query(
         `UPDATE matches
@@ -1375,61 +1624,74 @@ bot.action("players", async (ctx) => {
 
 // Рейтинг гравців
 
-  bot.action("ranking", async (ctx) => {
-    await ctx.answerCbQuery();
 
-    const result = await pool.query(
-      `SELECT
-         p.display_name,
-         COUNT(*)::int AS played,
-         COUNT(*) FILTER (
-           WHERE m.winner_team = mp.team
-         )::int AS wins,
-         COUNT(*) FILTER (
-           WHERE m.winner_team IS NULL
-         )::int AS draws,
-         COALESCE(SUM(
-           CASE
-             WHEN m.match_format = 'americano'
-               AND mp.team = 'A'
-               THEN m.americano_score_a
-             WHEN m.match_format = 'americano'
-               AND mp.team = 'B'
-               THEN m.americano_score_b
-             ELSE 0
-           END
-         ), 0)::int AS americano_points
-       FROM players p
-       JOIN match_players mp ON mp.player_id = p.telegram_id
-       JOIN matches m ON m.id = mp.match_id
-       WHERE m.status = 'completed'
-       GROUP BY p.telegram_id, p.display_name
-       ORDER BY wins DESC,
-         americano_points DESC,
-         played DESC,
-         p.display_name ASC
-       LIMIT 30`
-    );
+bot.action("ranking", async (ctx) => {
+  await ctx.answerCbQuery();
 
-    const text = result.rows.length
-      ? "🏆 Рейтинг гравців\n\n" +
-        result.rows.map((p, i) => {
-          const rate = p.played
-            ? Math.round((p.wins / p.played) * 100)
-            : 0;
+  const result = await pool.query(
+    `SELECT
+       p.telegram_id::text AS telegram_id,
+       p.display_name,
+       p.elo_rating,
+       COUNT(m.id)::int AS played,
+       COUNT(*) FILTER (
+         WHERE m.id IS NOT NULL
+           AND m.winner_team = mp.team
+       )::int AS wins,
+       COUNT(*) FILTER (
+         WHERE m.id IS NOT NULL
+           AND m.winner_team IS NULL
+       )::int AS draws,
+       COALESCE(SUM(
+         CASE
+           WHEN m.match_format = 'americano'
+             AND mp.team = 'A'
+             THEN m.americano_score_a
+           WHEN m.match_format = 'americano'
+             AND mp.team = 'B'
+             THEN m.americano_score_b
+           ELSE 0
+         END
+       ), 0)::int AS americano_points
+     FROM players p
+     LEFT JOIN match_players mp
+       ON mp.player_id = p.telegram_id
+     LEFT JOIN matches m
+       ON m.id = mp.match_id
+      AND m.status = 'completed'
+     GROUP BY p.telegram_id, p.display_name, p.elo_rating
+     ORDER BY p.elo_rating DESC,
+       wins DESC,
+       americano_points DESC,
+       p.display_name ASC
+     LIMIT 30`
+  );
 
-          return (
-            `${i + 1}. ${p.display_name}\n` +
-            `   🏆 ${p.wins} перемог / ${p.played} матчів\n` +
-            `   🤝 Нічиїх: ${p.draws}\n` +
-            `   ⚡ Очки Americano: ${p.americano_points}\n` +
-            `   📈 Перемог: ${rate}%`
-          );
-        }).join("\n\n")
-      : "Поки немає завершених матчів.";
+  const text = result.rows.length
+    ? "🏆 Рейтинг Padel Tracker\n\n" +
+      result.rows.map((p, i) => {
+        const elo = Number(p.elo_rating);
+        const played = Number(p.played);
+        const wins = Number(p.wins);
+        const draws = Number(p.draws);
+        const rate = played
+          ? Math.round((wins / played) * 100)
+          : 0;
 
-    await ctx.reply(text, mainMenu());
-  });
+        return (
+          `${i + 1}. ${p.display_name}\n` +
+          `   ${formatPadelRank(elo)}\n` +
+          `   🎯 ELO: ${elo}\n` +
+          `   🏆 ${wins} перемог / ${played} матчів\n` +
+          `   🤝 Нічиїх: ${draws}\n` +
+          `   ⚡ Очки Americano: ${p.americano_points}\n` +
+          `   📈 Перемог: ${rate}%`
+        );
+      }).join("\n\n")
+    : "Поки немає зареєстрованих гравців.";
+
+  await ctx.reply(text, mainMenu());
+});
 
 
 bot.catch((error) => {
