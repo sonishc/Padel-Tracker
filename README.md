@@ -75,16 +75,72 @@ npm start
 
 Після `npm run build` Express обслуговує і API, і React frontend на порту `PORT` (за замовчуванням 3000).
 
-## Deploy
+## Deploy on Render
 
-Для Elastic Beanstalk / Render / Railway:
+У репозиторії вже є `render.yaml` для одного Render Web Service: Express обслуговує API та зібраний React frontend з одного домену. Окремий Static Site або окремий frontend service не потрібні.
 
-- Build command: `npm ci && npm run build` (для чистого deploy закоміть `package-lock.json`, створений локальним `npm install`).
-- Start command: `npm start`.
-- Встанови `NODE_ENV=production`, `DATABASE_URL`, `SESSION_SECRET`, `APP_INVITE_CODE`, `TRUST_PROXY=1` (лише якщо застосунок за одним довіреним reverse proxy), `PORT` платформи.
-- Дозволь доступ до PostgreSQL тільки з адрес deploy-середовища; не відкривай БД у публічний інтернет.
-- Обов'язково використовуй HTTPS. У production session cookie має атрибут `Secure`.
-- Не додавай `.env` у git. Не передавай `DATABASE_URL`, `SESSION_SECRET` або invite-код у frontend.
+### 1. Підготуй базу даних
+
+Цей проєкт мігрує наявну PostgreSQL-схему старого Telegram Padel Tracker. Він очікує на існуючі таблиці `players`, `matches`, `match_players` та `match_sets`; не підключай порожню БД, якщо спершу не створив у ній legacy-схему.
+
+Перед міграцією:
+
+1. Зупини старого Telegram-бота, щоб він не записував у БД під час переходу.
+2. Зроби backup бази.
+3. Локально в `.env` вкажи **той самий** PostgreSQL URL, який використовував старий бот. Для Neon з локального комп'ютера використовуй External connection string з `sslmode=require`.
+4. Один раз виконай міграцію та створи адміністратора:
+
+```bash
+npm install
+npm run db:migrate
+npm run seed:admin
+```
+
+Для `seed:admin` заповни локальні `ADMIN_EMAIL`, `ADMIN_PASSWORD` (щонайменше 12 символів) та необов'язково `ADMIN_NAME` у `.env`. Не додавай `.env` у Git.
+
+Міграцію навмисно не запускаємо автоматично під час кожного Render deploy: це перетворення існуючої production-схеми, яке спочатку треба перевірити з backup. `seed:admin` теж запускай вручну лише один раз: повторний запуск для існуючого email скидає пароль і призначає роль admin.
+
+### 2. Деплой на Render через Blueprint
+
+1. Запуш цей проєкт у GitHub.
+2. У Render вибери **New → Blueprint** та підключи репозиторій.
+3. Render прочитає `render.yaml` і створить Web Service `padel-tracker-web`.
+4. Під час налаштування або в **Environment** заповни:
+   - `DATABASE_URL` — той самий PostgreSQL URL, який уже пройшов міграцію. Для Neon використовуй External connection string з `sslmode=require`.
+   - `APP_INVITE_CODE` — випадковий довгий секретний код (не менше 16 байтів), яким ділитимешся лише з учасниками групи.
+   - `SESSION_SECRET` Render згенерує автоматично через `generateValue`.
+5. Запусти deploy і перевір **Logs** та **Events**.
+
+Blueprint використовує Node `24.22.1`, `npm install --include=dev --no-audit --no-fund && npm run build`, `npm start` та HTTP health check `/api/health`. Render передає порт через `PORT`; не задавай його вручну в Environment. `TRUST_PROXY=1` потрібен, щоб Express коректно працював за Render reverse proxy та правильно виставляв Secure cookies.
+
+### 3. Якщо створюєш Web Service вручну
+
+Вибери Runtime **Node**, Root Directory — корінь цього проєкту, Build Command:
+
+```bash
+npm install --include=dev --no-audit --no-fund && npm run build
+```
+
+Start Command:
+
+```bash
+npm start
+```
+
+Health Check Path: `/api/health`.
+
+Додай Environment Variables: `NODE_ENV=production`, `TRUST_PROXY=1`, `DB_POOL_MAX=5`, `DATABASE_URL`, `SESSION_SECRET` (мінімум 32 байти), `APP_INVITE_CODE` (мінімум 16 байтів). Не додавай `PORT` — Render задає його автоматично.
+
+### 4. Перевір після deploy
+
+- Відкрий `https://<твій-сервіс>.onrender.com/api/health` — очікується JSON `{"ok":true,"service":"padel-tracker-web"}`.
+- Відкрий кореневу адресу сервісу — має завантажитися Padel Tracker.
+- Увійди під адміністратором, відкрий **Гравці** та видай email/пароль доступ старим гравцям.
+- Створи тестовий матч і перевір додавання сету / Americano до того, як запрошувати всю групу.
+
+Render Web Service не потребує persistent disk: застосунок не зберігає користувацькі файли локально. Дані матчів, гравців і сесій зберігаються в PostgreSQL. На безкоштовному Render сервіс може засинати після періоду неактивності; перший запит після цього може запускатися повільніше.
+
+Не виставляй `DATABASE_URL`, `SESSION_SECRET` або `APP_INVITE_CODE` у frontend чи Git. Для Render-hosted Postgres використовуй Internal URL лише коли сервіс і БД в одному Render workspace та region; для зовнішньої Neon БД використовуй її External URL з TLS.
 
 ## Облікові записи після переходу
 

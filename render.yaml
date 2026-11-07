@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: padel-tracker-web
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install --include=dev --no-audit --no-fund && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "1"
+      - key: DB_POOL_MAX
+        value: "5"
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_INVITE_CODE
+        sync: false
