@@ -83,6 +83,12 @@ const writeLimiter = rateLimit({
 type Role = "admin" | "player";
 type MatchFormat = "sets" | "americano";
 
+type EloPlayer = {
+  player_id: string;
+  team: Team;
+  elo_rating: number;
+};
+
 type AuthPlayer = {
   id: string;
   displayName: string;
